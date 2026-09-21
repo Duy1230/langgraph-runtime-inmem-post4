@@ -1,0 +1,1017 @@
+--- a/README.md
++++ b/README.md
+@@ -1,4 +1,55 @@
+ # langgraph-runtime-inmem 0.33.3 TTL, persistence, and lifecycle fixes
++
++## Local PostgreSQL review candidate (2026-09-19)
++
++The local version `0.33.3.post4+review.20260919` adds wheel-packaged PostgreSQL
++hooks, bounded reconnecting pools, numeric Store range filters, fractional TTL
++refresh, run checkpoint deletion and delta-safe `keep_latest` pruning. Built-in
++Store snapshots are loaded only when that Store is actually used.
++
++After installing this wheel with its `[postgres]` extra, a user graph can use:
++
++```json
++{
++  "dependencies": ["langgraph-runtime-inmem"],
++  "graphs": {"agent": "./graph.py:graph"},
++  "checkpointer": {
++    "path": "langgraph_runtime_inmem.postgres.checkpointer",
++    "ttl": {"strategy": "keep_latest", "default_ttl": 43200, "sweep_interval_minutes": 1}
++  },
++  "store": {"path": "langgraph_runtime_inmem.postgres.store"}
++}
++```
++
++Set `DATABASE_URL`, or separate `STORE_DATABASE_URL` and
++`CHECKPOINT_DATABASE_URL`. The Store TTL defaults and sweep interval are still
++controlled by the `STORE_TTL_*` environment variables described below. The hooks
++perform schema setup and a one-time `store.ttl_minutes` conversion to double
++precision, so their startup account must own the schema. This does not restore
++fractional values already rounded by the old integer column.
++
++These hooks were verified with `langgraph-api==0.13.3`,
++`langgraph-checkpoint-postgres==3.1.2`, and PostgreSQL 17. Each hook lifecycle has
++a pool of 1–8 connections with a 5-second acquisition timeout and at most 64
++waiters. Total connections multiply with event loops and replicas.
++
++This is **not a durable production Agent Server**: thread/run/assistant metadata
++still uses local in-memory runtime snapshots, flushed roughly every 10 seconds.
++An acknowledged new thread was observed to return HTTP 404 after immediate
++SIGKILL even though its three checkpoints and Store item survived in PostgreSQL.
++Graceful restarts and older flushed threads were recovered successfully. Use a
++durable runtime metadata backend before requiring crash-safe acknowledgements
++or multiple replicas; retain `.langgraph_api` for this single-replica dev runtime.
++
++Pruning is transactional, preserves shared blobs and required DeltaChannel
++ancestors, and conservatively serializes maintenance using a table-level lock.
++It scans checkpoint metadata for each affected thread. Large histories or
++high-write deployments need a different maintenance strategy and further load
++testing. Application side effects in Store or external services are not undone
++by checkpoint rollback.
++
++The original post4 documentation follows; its historical version/test claims
++describe the starting artifact, not certification of this review candidate.
+ 
+ This is a source-compatible patch for `langgraph-runtime-inmem==0.33.3`.  The
+ wheel version is `0.33.3.post4` so pip can distinguish it from the unpatched
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -4,7 +4,7 @@
+ 
+ [project]
+ name = "langgraph-runtime-inmem"
+-version = "0.33.3.post4"
++version = "0.33.3.post4+review.20260919"
+ description = "In-memory implementation for the LangGraph API server, patched with TTL, persistence, and lifecycle fixes."
+ readme = "README.md"
+ requires-python = ">=3.11"
+--- a/src/langgraph_runtime_inmem/__init__.py
++++ b/src/langgraph_runtime_inmem/__init__.py
+@@ -11,7 +11,7 @@
+     thread_ttl,
+ )
+ 
+-__version__ = "0.33.3.post4"
++__version__ = "0.33.3.post4+review.20260919"
+ __all__ = [
+     "ops",
+     "database",
+--- a/src/langgraph_runtime_inmem/database.py
++++ b/src/langgraph_runtime_inmem/database.py
+@@ -216,14 +216,16 @@
+     stop_flush_loop()
+     await asyncio.to_thread(close_persistent_dict, GLOBAL_STORE)
+     await asyncio.to_thread(GLOBAL_RETRY_COUNTER.close)
+-    from langgraph_runtime_inmem.checkpoint import Checkpointer  # noqa: PLC0415
++    from langgraph_runtime_inmem.checkpoint import MEMORY  # noqa: PLC0415
+     from langgraph_runtime_inmem.store import STORE  # noqa: PLC0415
+ 
+-    await STORE.stop_ttl_sweeper(timeout=5)
+-    await asyncio.to_thread(STORE.close)
+-
+-    async with Checkpointer():
+-        pass
++    if STORE is not None:
++        await STORE.stop_ttl_sweeper(timeout=5)
++        await asyncio.to_thread(STORE.close)
++
++    if MEMORY is not None:
++        async with MEMORY:
++            pass
+     await stop_stream()
+ 
+ 
+--- a/src/langgraph_runtime_inmem/store.py
++++ b/src/langgraph_runtime_inmem/store.py
+@@ -417,26 +417,35 @@
+ _VECTOR_FILE = os.path.join(".langgraph_api", "store.vectors.pckl")
+ _TTL_FILE = os.path.join(".langgraph_api", "store.ttl.pckl")
+ os.makedirs(".langgraph_api", exist_ok=True)
+-STORE = DiskBackedInMemStore()
++STORE: DiskBackedInMemStore | None = None
+ BATCHED_STORE = threading.local()
++_STORE_LOCK = threading.Lock()
+ 
+ 
+ def set_store_config(config: dict) -> None:
+     global _STORE_CONFIG, STORE
++    _STORE_CONFIG = config.copy()
++    if _STORE_CONFIG.get("path"):
++        return
+     from langgraph_api.graph import resolve_embeddings
+ 
+-    _STORE_CONFIG = config.copy()
+     index_config = _STORE_CONFIG.get("index", {})
+     if index_config:
+         _STORE_CONFIG["index"]["embed"] = resolve_embeddings(index_config)
+         index_config["embed"] = _STORE_CONFIG["index"]["embed"]
+     ttl_config = _STORE_CONFIG.get("ttl") or None
+     # Re-create the store
+-    STORE.close()
++    if STORE is not None:
++        STORE.close()
+     STORE = DiskBackedInMemStore(index=index_config, ttl=ttl_config)
+ 
+ 
+ def Store(*args: Any, **kwargs: Any) -> BatchedStore:
++    global STORE
++    if STORE is None:
++        with _STORE_LOCK:
++            if STORE is None:
++                STORE = DiskBackedInMemStore()
+     if not hasattr(BATCHED_STORE, "store") or BATCHED_STORE.store._store is not STORE:
+         BATCHED_STORE.store = BatchedStore(STORE)
+     return BATCHED_STORE.store
+--- a/src/langgraph_runtime_inmem/ops.py
++++ b/src/langgraph_runtime_inmem/ops.py
+@@ -1399,25 +1399,18 @@
+         ctx: Auth.types.BaseAuthContext | None = None,
+     ) -> AsyncIterator[UUID]:
+         """Delete a thread by ID and cascade delete all associated runs."""
+-        thread_list = conn.store["threads"]
+-        thread_idx = None
+-        matching_thread = None
+         thread_id = _ensure_uuid(thread_id)
+-
+-        # Find the thread to delete
+-        for idx, thread in enumerate(thread_list):
+-            if thread["thread_id"] == thread_id:
+-                thread_idx = idx
+-                matching_thread = thread
+-                break
++        matching_thread = next(
++            (thread for thread in conn.store["threads"] if thread["thread_id"] == thread_id),
++            None,
++        )
+         filters = await Threads.handle_event(
+             ctx,
+             "delete",
+             Auth.types.ThreadsDelete(thread_id=thread_id),
+         )
+         if (
+-            thread_idx is None
+-            or matching_thread is None
++            matching_thread is None
+             or (
+                 filters
+                 and not _check_filter_match(matching_thread["metadata"], filters)
+@@ -1426,6 +1419,10 @@
+             raise HTTPException(
+                 status_code=404, detail=f"Thread with ID {thread_id} not found"
+             )
++        # External cleanup may yield or fail. Keep metadata until it succeeds,
++        # then remove by identity: concurrent deletions invalidate list indexes.
++        await _delete_checkpoints_for_thread(thread_id, conn)
++        await get_stream_manager().delete_thread(thread_id)
+         # Cascade delete all runs associated with this thread
+         conn.store["runs"] = [
+             run for run in conn.store["runs"] if run["thread_id"] != thread_id
+@@ -1434,26 +1431,15 @@
+         conn.store["crons"] = [
+             c for c in conn.store["crons"] if str(c.get("thread_id")) != str(thread_id)
+         ]
+-        await _delete_checkpoints_for_thread(thread_id, conn)
+-        await get_stream_manager().delete_thread(thread_id)
+-
+-        if thread_idx is not None:
+-            # Remove the thread from the store
+-            deleted_thread = thread_list.pop(thread_idx)
+-            _thread_ttl_store(conn).pop(str(thread_id), None)
+-
+-            # Return an async iterator with the deleted thread_id
+-            async def id_iterator() -> AsyncIterator[UUID]:
+-                yield deleted_thread["thread_id"]
+-
+-            return id_iterator()
+-
+-        # If thread not found, return empty iterator
+-        async def empty_iterator() -> AsyncIterator[UUID]:
+-            if False:  # This ensures the iterator is empty
+-                yield
+-
+-        return empty_iterator()
++        conn.store["threads"] = [
++            thread for thread in conn.store["threads"] if thread is not matching_thread
++        ]
++        _thread_ttl_store(conn).pop(str(thread_id), None)
++
++        async def id_iterator() -> AsyncIterator[UUID]:
++            yield thread_id
++
++        return id_iterator()
+ 
+     @staticmethod
+     async def prune(
+@@ -3052,7 +3038,10 @@
+         # only then return 404.
+         await _delete_checkpoints_for_thread(thread_id, conn, run_id=run_id)
+         await get_stream_manager().delete_run(run_id, thread_id)
+-        del conn.store["runs"][run_idx]
++        conn.store["runs"] = [
++            run for run in conn.store["runs"]
++            if not (run["run_id"] == run_id and run["thread_id"] == thread_id)
++        ]
+ 
+         async def _yield_deleted():
+             await logger.ainfo("Run deleted", run_id=run_id)
+--- /dev/null
++++ b/src/langgraph_runtime_inmem/postgres.py
+@@ -0,0 +1,240 @@
++"""Optional PostgreSQL helpers for the Agent Server's custom persistence hooks."""
++
++import math
++import os
++from collections.abc import Sequence
++from contextlib import asynccontextmanager
++
++from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
++from langgraph.store.postgres.aio import AsyncPostgresStore
++from psycopg.rows import dict_row
++from psycopg_pool import AsyncConnectionPool
++
++POOL_CONFIG = {
++    "min_size": 1,
++    "max_size": 8,
++    "timeout": 5,
++    "max_waiting": 64,
++    "check": AsyncConnectionPool.check_connection,
++    "kwargs": {
++        "autocommit": True,
++        "prepare_threshold": 0,
++        "row_factory": dict_row,
++        "connect_timeout": 3,
++        "options": "-c statement_timeout=15000",
++    },
++}
++
++
++class RuntimePostgresStore(AsyncPostgresStore):
++    def _get_filter_condition(self, key, op, value):
++        symbols = {"$gt": ">", "$gte": ">=", "$lt": "<", "$lte": "<="}
++        if (
++            op in symbols
++            and isinstance(value, (int, float))
++            and not isinstance(value, bool)
++        ):
++            return (
++                (
++                    "CASE WHEN jsonb_typeof(value->%s) = 'number' "
++                    f"THEN (value->>%s)::numeric END {symbols[op]} %s"
++                ),
++                [key, key, value],
++            )
++        return super()._get_filter_condition(key, op, value)
++
++
++async def ensure_store_ttl_precision(store) -> None:
++    """Upstream 3.1.2 stores TTL minutes as INT, which breaks fractional refresh."""
++    async with store._cursor() as cur:
++        await cur.execute(
++            "SELECT atttypid = 'double precision'::regtype AS ready "
++            "FROM pg_attribute WHERE attrelid = 'store'::regclass "
++            "AND attname = 'ttl_minutes' AND NOT attisdropped"
++        )
++        row = await cur.fetchone()
++        if not row or not row["ready"]:
++            await cur.execute(
++                "ALTER TABLE store ALTER COLUMN ttl_minutes TYPE DOUBLE PRECISION "
++                "USING ttl_minutes::double precision"
++            )
++
++
++class RuntimePostgresSaver(AsyncPostgresSaver):
++    """Add run deletion and delta-safe pruning required by langgraph-api 0.13.3."""
++
++    @classmethod
++    @asynccontextmanager
++    async def from_conn_string(cls, conn_string, *, pipeline=False, serde=None):
++        if pipeline:
++            async with super().from_conn_string(
++                conn_string, pipeline=True, serde=serde
++            ) as saver:
++                yield saver
++            return
++        async with AsyncConnectionPool(conn_string, open=False, **POOL_CONFIG) as pool:
++            await pool.wait(timeout=5)
++            yield cls(pool, serde=serde)
++
++    async def adelete_for_runs(self, run_ids: Sequence[str]) -> None:
++        if run_ids:
++            await self._remove_history(run_ids=[str(value) for value in run_ids])
++
++    async def aprune(
++        self, thread_ids: Sequence[str], *, strategy="keep_latest"
++    ) -> None:
++        if strategy not in {"keep_latest", "delete", "delete_all"}:
++            raise ValueError(f"Unsupported prune strategy: {strategy!r}")
++        if not thread_ids:
++            return
++        if strategy in {"delete", "delete_all"}:
++            for thread_id in thread_ids:
++                await self.adelete_thread(str(thread_id))
++        else:
++            await self._remove_history(thread_ids=[str(value) for value in thread_ids])
++
++    async def _remove_history(self, *, thread_ids=None, run_ids=None) -> None:
++        # ponytail: table-level maintenance lock and O(history) metadata per thread;
++        # use coordinated per-thread writer locks and paged SQL for large deployments.
++        async with self._cursor() as cur, cur.connection.transaction():
++            await cur.execute("SET LOCAL lock_timeout = '5s'")
++            await cur.execute("SET LOCAL statement_timeout = '15s'")
++            await cur.execute(
++                "LOCK TABLE checkpoints, checkpoint_blobs, checkpoint_writes "
++                "IN SHARE ROW EXCLUSIVE MODE"
++            )
++            if run_ids is not None:
++                await cur.execute(
++                    "SELECT DISTINCT thread_id FROM checkpoints "
++                    "WHERE metadata->>'run_id' = ANY(%s)",
++                    (run_ids,),
++                )
++                thread_ids = [row["thread_id"] for row in await cur.fetchall()]
++            for thread_id in thread_ids:
++                await cur.execute(
++                    "SELECT checkpoint_ns, checkpoint_id, parent_checkpoint_id, "
++                    "checkpoint->'channel_versions' AS versions, "
++                    "metadata->'counters_since_delta_snapshot' AS delta, "
++                    "metadata->>'run_id' AS run_id "
++                    "FROM checkpoints WHERE thread_id = %s",
++                    (thread_id,),
++                )
++                rows = {
++                    (r["checkpoint_ns"], r["checkpoint_id"]): r
++                    for r in await cur.fetchall()
++                }
++                if not rows:
++                    continue
++                if run_ids is not None:
++                    candidates = {
++                        key for key, row in rows.items() if row["run_id"] in run_ids
++                    }
++                else:
++                    latest = {}
++                    for ns, checkpoint_id in rows:
++                        latest[ns] = max(checkpoint_id, latest.get(ns, ""))
++                    candidates = set(rows) - set(latest.items())
++                await cur.execute(
++                    "SELECT checkpoint_ns, channel, version FROM checkpoint_blobs "
++                    "WHERE thread_id = %s AND type <> 'empty'",
++                    (thread_id,),
++                )
++                materialized = {
++                    (r["checkpoint_ns"], r["channel"], r["version"])
++                    for r in await cur.fetchall()
++                }
++                protected = set()
++                for key in rows.keys() - candidates:
++                    ns, _ = key
++                    row = rows[key]
++                    needed = {
++                        channel
++                        for channel in (row["delta"] or {})
++                        if channel in (row["versions"] or {})
++                        and (ns, channel, str(row["versions"][channel]))
++                        not in materialized
++                    }
++                    parent = row["parent_checkpoint_id"]
++                    visited = set()
++                    while parent and needed:
++                        parent_key = (ns, parent)
++                        if parent_key in visited or parent_key not in rows:
++                            break
++                        visited.add(parent_key)
++                        protected.add(parent_key)
++                        row = rows[parent_key]
++                        needed = {
++                            channel
++                            for channel in needed
++                            if (ns, channel, str((row["versions"] or {}).get(channel)))
++                            not in materialized
++                        }
++                        parent = row["parent_checkpoint_id"]
++                removed = [
++                    (thread_id, ns, checkpoint_id)
++                    for ns, checkpoint_id in candidates - protected
++                ]
++                if not removed:
++                    continue
++                await cur.executemany(
++                    "DELETE FROM checkpoint_writes WHERE thread_id = %s "
++                    "AND checkpoint_ns = %s AND checkpoint_id = %s",
++                    removed,
++                )
++                await cur.executemany(
++                    "DELETE FROM checkpoints WHERE thread_id = %s "
++                    "AND checkpoint_ns = %s AND checkpoint_id = %s",
++                    removed,
++                )
++                await cur.execute(
++                    "DELETE FROM checkpoint_blobs b WHERE b.thread_id = %s "
++                    "AND NOT EXISTS (SELECT 1 FROM checkpoints c "
++                    "WHERE c.thread_id = b.thread_id AND c.checkpoint_ns = b.checkpoint_ns "
++                    "AND c.checkpoint->'channel_versions'->>b.channel = b.version)",
++                    (thread_id,),
++                )
++
++
++def store_ttl_config():
++    ttl = float(os.getenv("STORE_TTL_DEFAULT_MINUTES", "10080"))
++    interval = float(os.getenv("STORE_TTL_SWEEP_INTERVAL_MINUTES", "1"))
++    if not math.isfinite(ttl) or ttl < 0:
++        raise ValueError("STORE_TTL_DEFAULT_MINUTES must be finite and non-negative")
++    if not math.isfinite(interval) or interval <= 0:
++        raise ValueError("STORE_TTL_SWEEP_INTERVAL_MINUTES must be finite and positive")
++    return {
++        "default_ttl": ttl,
++        "refresh_on_read": os.getenv("STORE_TTL_REFRESH_ON_READ", "true")
++        .strip()
++        .lower()
++        in {"1", "true", "yes", "on"},
++        "sweep_interval_minutes": interval,
++    }
++
++
++@asynccontextmanager
++async def store():
++    """Packaged custom Store hook; setup requires schema-owner privileges."""
++    ttl = store_ttl_config()
++    database_url = os.getenv("STORE_DATABASE_URL") or os.environ["DATABASE_URL"]
++    async with RuntimePostgresStore.from_conn_string(
++        database_url,
++        pool_config=POOL_CONFIG,
++        ttl=ttl,
++    ) as instance:
++        await instance.setup()
++        await ensure_store_ttl_precision(instance)
++        await instance.start_ttl_sweeper()
++        try:
++            yield instance
++        finally:
++            await instance.stop_ttl_sweeper()
++
++
++@asynccontextmanager
++async def checkpointer():
++    """Packaged custom checkpointer hook, using a reconnecting bounded pool."""
++    database_url = os.getenv("CHECKPOINT_DATABASE_URL") or os.environ["DATABASE_URL"]
++    async with RuntimePostgresSaver.from_conn_string(database_url) as saver:
++        await saver.setup()
++        yield saver
+--- a/example/postgres_store.py
++++ b/example/postgres_store.py
+@@ -1,46 +1,5 @@
+-"""PostgreSQL-backed Store for the otherwise in-memory API runtime."""
++"""Compatibility exports; the PostgreSQL integration is included in the wheel."""
+ 
+-from __future__ import annotations
++from langgraph_runtime_inmem.postgres import store, store_ttl_config
+ 
+-import os
+-from collections.abc import AsyncIterator
+-from contextlib import asynccontextmanager
+-from typing import TYPE_CHECKING, Any
+-
+-if TYPE_CHECKING:
+-    from langgraph.store.postgres.aio import AsyncPostgresStore
+-
+-
+-def _as_bool(value: str) -> bool:
+-    return value.strip().lower() in {"1", "true", "yes", "on"}
+-
+-
+-def store_ttl_config() -> dict[str, Any]:
+-    """Build Store TTL settings from environment variables."""
+-    return {
+-        "default_ttl": float(os.getenv("STORE_TTL_DEFAULT_MINUTES", "10080")),
+-        "refresh_on_read": _as_bool(
+-            os.getenv("STORE_TTL_REFRESH_ON_READ", "true")
+-        ),
+-        "sweep_interval_minutes": float(
+-            os.getenv("STORE_TTL_SWEEP_INTERVAL_MINUTES", "1")
+-        ),
+-    }
+-
+-
+-@asynccontextmanager
+-async def store() -> AsyncIterator[AsyncPostgresStore]:
+-    """Create the PostgreSQL Store and run its TTL sweeper for the API lifespan."""
+-    from langgraph.store.postgres.aio import AsyncPostgresStore
+-
+-    database_url = os.getenv("STORE_DATABASE_URL") or os.environ["DATABASE_URL"]
+-    async with AsyncPostgresStore.from_conn_string(
+-        database_url,
+-        ttl=store_ttl_config(),
+-    ) as postgres_store:
+-        await postgres_store.setup()
+-        await postgres_store.start_ttl_sweeper()
+-        try:
+-            yield postgres_store
+-        finally:
+-            await postgres_store.stop_ttl_sweeper()
++__all__ = ["store", "store_ttl_config"]
+--- a/example/postgres_checkpointer.py
++++ b/example/postgres_checkpointer.py
+@@ -1,22 +1,5 @@
+-"""PostgreSQL-backed checkpointer for the otherwise in-memory API runtime."""
++"""Compatibility export; the PostgreSQL integration is included in the wheel."""
+ 
+-from __future__ import annotations
++from langgraph_runtime_inmem.postgres import checkpointer
+ 
+-import os
+-from collections.abc import AsyncIterator
+-from contextlib import asynccontextmanager
+-from typing import TYPE_CHECKING
+-
+-if TYPE_CHECKING:
+-    from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+-
+-
+-@asynccontextmanager
+-async def checkpointer() -> AsyncIterator[AsyncPostgresSaver]:
+-    """Create, initialize, and close the API's PostgreSQL checkpointer."""
+-    from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+-
+-    database_url = os.getenv("CHECKPOINT_DATABASE_URL") or os.environ["DATABASE_URL"]
+-    async with AsyncPostgresSaver.from_conn_string(database_url) as saver:
+-        await saver.setup()
+-        yield saver
++__all__ = ["checkpointer"]
+--- a/tests/test_postgres_example.py
++++ b/tests/test_postgres_example.py
+@@ -36,6 +36,9 @@
+ 
+ 
+ def test_postgres_checkpointer_lifecycle(monkeypatch: pytest.MonkeyPatch) -> None:
++    pytest.importorskip("langgraph.checkpoint.postgres.aio")
++    from langgraph_runtime_inmem import postgres
++
+     events: list[Any] = []
+ 
+     class FakeSaver:
+@@ -60,6 +63,7 @@
+     monkeypatch.setitem(sys.modules, "langgraph.checkpoint.postgres", postgres_module)
+     monkeypatch.setitem(sys.modules, "langgraph.checkpoint.postgres.aio", aio_module)
+     monkeypatch.setenv("DATABASE_URL", "postgresql://test/database")
++    monkeypatch.setattr(postgres, "RuntimePostgresSaver", FakeSaver)
+ 
+     module_path = ROOT / "example" / "postgres_checkpointer.py"
+     spec = importlib.util.spec_from_file_location("postgres_checkpointer", module_path)
+@@ -83,13 +87,22 @@
+ def test_postgres_store_lifecycle_keeps_ttl_enabled(
+     monkeypatch: pytest.MonkeyPatch,
+ ) -> None:
++    pytest.importorskip("langgraph.store.postgres.aio")
++    from langgraph_runtime_inmem import postgres
++
+     events: list[Any] = []
++
++    async def precision(store):
++        events.append("precision")
++
++    monkeypatch.setattr(postgres, "ensure_store_ttl_precision", precision)
+ 
+     class FakeStore:
+         @classmethod
+         def from_conn_string(
+-            cls, connection_string: str, *, ttl: dict[str, Any]
++            cls, connection_string: str, *, ttl: dict[str, Any], pool_config: dict
+         ) -> FakeStore:
++            assert pool_config["max_size"] == 8
+             events.append(("connect", connection_string, ttl))
+             return cls()
+ 
+@@ -112,6 +125,7 @@
+     postgres_module = ModuleType("langgraph.store.postgres")
+     aio_module = ModuleType("langgraph.store.postgres.aio")
+     aio_module.AsyncPostgresStore = FakeStore  # type: ignore[attr-defined]
++    monkeypatch.setattr(postgres, "RuntimePostgresStore", FakeStore)
+     monkeypatch.setitem(sys.modules, "langgraph.store.postgres", postgres_module)
+     monkeypatch.setitem(sys.modules, "langgraph.store.postgres.aio", aio_module)
+     monkeypatch.setenv("DATABASE_URL", "postgresql://fallback/database")
+@@ -129,7 +143,7 @@
+     async def exercise_store() -> None:
+         async with module.store() as postgres_store:
+             assert isinstance(postgres_store, FakeStore)
+-            assert events[-2:] == ["setup", "start_ttl"]
++            assert events[-3:] == ["setup", "precision", "start_ttl"]
+ 
+     asyncio.run(exercise_store())
+     assert events == [
+@@ -144,6 +158,7 @@
+         ),
+         "enter",
+         "setup",
++        "precision",
+         "start_ttl",
+         "stop_ttl",
+         "exit",
+--- a/tests/test_thread_ttl.py
++++ b/tests/test_thread_ttl.py
+@@ -1,5 +1,6 @@
+ from __future__ import annotations
+ 
++import asyncio
+ from contextlib import asynccontextmanager
+ from datetime import UTC, datetime, timedelta
+ from uuid import UUID, uuid4
+@@ -28,6 +29,55 @@
+     @asynccontextmanager
+     async def pipeline(self):
+         yield None
++
++
++@pytest.mark.parametrize("kind", ["threads", "runs"])
++async def test_concurrent_deletions_preserve_unrelated_records(conn, monkeypatch, kind):
++    manager = StreamManager()
++    monkeypatch.setattr(ops, "get_stream_manager", lambda: manager)
++    threads = [await create_thread(conn) for _ in range(3)]
++    runs = [{"run_id": uuid4(), "thread_id": t["thread_id"], "status": "success"} for t in threads]
++    conn.store["runs"].extend(runs)
++    arrived = 0
++    barrier = asyncio.Event()
++
++    async def cleanup(*args, **kwargs):
++        nonlocal arrived
++        arrived += 1
++        ordinal = arrived
++        if arrived == 2:
++            barrier.set()
++        await barrier.wait()
++        if ordinal == 2:
++            await asyncio.sleep(0.02)
++
++    monkeypatch.setattr(ops, "_delete_checkpoints_for_thread", cleanup)
++    async def delete(i):
++        if kind == "threads":
++            result = await ops.Threads.delete(conn, threads[i]["thread_id"])
++            assert await anext(result) == threads[i]["thread_id"]
++        else:
++            result = await ops.Runs.delete(conn, runs[i]["run_id"], thread_id=threads[i]["thread_id"])
++            assert await anext(result) == runs[i]["run_id"]
++    await asyncio.wait_for(asyncio.gather(delete(0), delete(1)), timeout=2)
++    assert conn.store["runs"] == [runs[2]]
++    assert conn.store["threads"] == ([threads[2]] if kind == "threads" else threads)
++
++
++async def test_checkpoint_delete_failure_preserves_thread_metadata(conn, monkeypatch):
++    thread = await create_thread(conn)
++    run = {"run_id": uuid4(), "thread_id": thread["thread_id"], "status": "success"}
++    conn.store["runs"].append(run)
++    cron = {"thread_id": str(thread["thread_id"])}
++    conn.store["crons"].append(cron)
++    async def fail(*args, **kwargs):
++        raise RuntimeError("database unavailable")
++    monkeypatch.setattr(ops, "_delete_checkpoints_for_thread", fail)
++    with pytest.raises(RuntimeError, match="unavailable"):
++        await ops.Threads.delete(conn, thread["thread_id"])
++    assert conn.store["threads"] == [thread]
++    assert conn.store["runs"] == [run]
++    assert conn.store["crons"] == [cron]
+ 
+ 
+ @pytest.fixture
+--- /dev/null
++++ b/tests/integration/test_postgres_review.py
+@@ -0,0 +1,319 @@
++"""Regression checks discovered through real post4 user journeys."""
++
++import importlib.util
++import operator
++import os
++import subprocess
++import sys
++import uuid
++from contextlib import asynccontextmanager
++from pathlib import Path
++from typing import Annotated, TypedDict
++
++import pytest
++from langgraph.channels import DeltaChannel
++from langgraph.graph import END, START, StateGraph
++
++
++def merge_deltas(state, writes):
++    return state + [item for batch in writes for item in batch]
++
++
++class GraphState(TypedDict):
++    events: Annotated[list[str], operator.add]
++    payload: dict
++
++
++class DeltaState(TypedDict):
++    events: Annotated[list[str], DeltaChannel(merge_deltas, snapshot_frequency=3)]
++
++
++class LongDeltaState(TypedDict):
++    events: Annotated[list[str], DeltaChannel(merge_deltas, snapshot_frequency=1000)]
++
++
++def example(name):
++    path = Path(__file__).parents[2] / "example" / f"{name}.py"
++    spec = importlib.util.spec_from_file_location(name, path)
++    module = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(module)
++    return module
++
++
++def test_custom_store_never_loads_old_sidecars(tmp_path):
++    folder = tmp_path / ".langgraph_api"
++    folder.mkdir()
++    sidecar = folder / "store.pckl"
++    sidecar.write_bytes(b"intentionally invalid legacy sidecar")
++    result = subprocess.run(
++        [
++            sys.executable,
++            "-c",
++            (
++                "from langgraph_runtime_inmem import store; "
++                "assert store.STORE is None; store.set_store_config({'path': 'custom.store'}); "
++                "assert store.STORE is None"
++            ),
++        ],
++        cwd=tmp_path,
++        capture_output=True,
++        text=True,
++        timeout=15,
++        check=False,
++    )
++    assert result.returncode == 0, result.stderr
++    assert sidecar.read_bytes() == b"intentionally invalid legacy sidecar"
++
++
++def test_shutdown_does_not_initialize_unused_checkpointer(tmp_path):
++    result = subprocess.run(
++        [sys.executable, "-c", (
++            "import asyncio; from langgraph_runtime_inmem import checkpoint, database; "
++            "assert checkpoint.MEMORY is None; asyncio.run(database.stop_pool()); "
++            "assert checkpoint.MEMORY is None"
++        )],
++        cwd=tmp_path, capture_output=True, text=True, timeout=15, check=False,
++    )
++    assert result.returncode == 0, result.stderr
++
++
++@pytest.mark.integration
++async def test_postgres_fractional_ttl_survives_refresh(monkeypatch):
++    url = os.getenv("TEST_POSTGRES_DATABASE_URL")
++    if not url:
++        pytest.skip("TEST_POSTGRES_DATABASE_URL not configured")
++    monkeypatch.setenv("STORE_DATABASE_URL", url)
++    monkeypatch.setenv("STORE_TTL_SWEEP_INTERVAL_MINUTES", "1")
++    namespace = ("fractional", str(uuid.uuid4()))
++    async with example("postgres_store").store() as store:
++        await store.aput(namespace, "key", {"v": 1}, ttl=0.1)
++        await store.aget(namespace, "key", refresh_ttl=True)
++        async with store._cursor() as cur:
++            await cur.execute(
++                "SELECT ttl_minutes, extract(epoch from expires_at - now()) AS seconds "
++                "FROM store WHERE key = 'key' AND prefix LIKE %s",
++                (f"%{namespace[1]}%",),
++            )
++            row = await cur.fetchone()
++        assert row["ttl_minutes"] == pytest.approx(0.1), row
++        assert 4 < row["seconds"] <= 6, row
++        await store.adelete(namespace, "key")
++
++
++@pytest.mark.integration
++@pytest.mark.parametrize("delta", [False, 3, 1000])
++async def test_postgres_prune_and_delete_preserve_survivors(delta):
++    from langgraph_runtime_inmem.postgres import RuntimePostgresSaver
++
++    url = os.getenv("TEST_POSTGRES_DATABASE_URL")
++    if not url:
++        pytest.skip("TEST_POSTGRES_DATABASE_URL not configured")
++    tid = str(uuid.uuid4())
++    cfg = {"configurable": {"thread_id": tid}}
++    builder = StateGraph(
++        {False: GraphState, 3: DeltaState, 1000: LongDeltaState}[delta]
++    )
++    builder.add_node("step", lambda state: {"events": ["node"]})
++    builder.add_edge(START, "step")
++    builder.add_edge("step", END)
++    async with RuntimePostgresSaver.from_conn_string(url) as saver:
++        await saver.setup()
++        graph = builder.compile(checkpointer=saver)
++        runs = [str(uuid.uuid4()) for _ in range(4)]
++        try:
++            for i, rid in enumerate(runs[:3]):
++                await graph.ainvoke(
++                    {
++                        "events": [str(i)],
++                        **({"payload": {"shared": [1, 2, 3]}} if i == 0 else {}),
++                    },
++                    {**cfg, "metadata": {"run_id": rid}},
++                )
++            before = (await graph.aget_state(cfg)).values
++            await saver.adelete_for_runs([runs[0]])
++            assert (await graph.aget_state(cfg)).values == before
++            count_before = len([cp async for cp in saver.alist(cfg)])
++            await saver.aprune([tid])
++            assert (await graph.aget_state(cfg)).values == before
++            count_after = len([cp async for cp in saver.alist(cfg)])
++            assert count_after <= count_before
++            if not delta:
++                assert count_after == 1
++            result = await graph.ainvoke(
++                {"events": ["after"]}, {**cfg, "metadata": {"run_id": runs[3]}}
++            )
++            assert result["events"] == before["events"] + ["after", "node"]
++            await saver.adelete_for_runs([runs[3]])
++            assert (await graph.aget_state(cfg)).values == before
++            # The operation is idempotent, and cleanup removes all payload tables.
++            await saver.adelete_for_runs([runs[3]])
++            await saver.aprune([tid], strategy="delete_all")
++            assert not [cp async for cp in saver.alist(cfg)]
++            async with saver._cursor() as cur:
++                for table in ("checkpoints", "checkpoint_blobs", "checkpoint_writes"):
++                    await cur.execute(
++                        f"SELECT count(*) AS n FROM {table} WHERE thread_id=%s", (tid,)
++                    )
++                    assert (await cur.fetchone())["n"] == 0
++        finally:
++            await saver.adelete_thread(tid)
++
++
++@pytest.mark.integration
++@pytest.mark.parametrize(
++    "op, expected",
++    [
++        ("$gt", [100]),
++        ("$gte", [50, 100]),
++        ("$lt", [5]),
++        ("$lte", [5, 50]),
++    ],
++)
++async def test_store_numeric_filters_ignore_other_json_types(monkeypatch, op, expected):
++    url = os.getenv("TEST_POSTGRES_DATABASE_URL")
++    if not url:
++        pytest.skip("TEST_POSTGRES_DATABASE_URL not configured")
++    monkeypatch.setenv("STORE_DATABASE_URL", url)
++    namespace = ("numeric", str(uuid.uuid4()))
++    async with example("postgres_store").store() as store:
++        values = [5, 50, 100, "not-a-number", None, True]
++        try:
++            for i, value in enumerate(values):
++                await store.aput(namespace, str(i), {"score": value})
++            found = await store.asearch(namespace, filter={"score": {op: 50}})
++            assert sorted(item.value["score"] for item in found) == expected
++        finally:
++            for i in range(len(values)):
++                await store.adelete(namespace, str(i))
++
++
++@pytest.mark.parametrize(
++    "name,value",
++    [
++        ("STORE_TTL_DEFAULT_MINUTES", "nan"),
++        ("STORE_TTL_DEFAULT_MINUTES", "-1"),
++        ("STORE_TTL_SWEEP_INTERVAL_MINUTES", "inf"),
++        ("STORE_TTL_SWEEP_INTERVAL_MINUTES", "0"),
++    ],
++)
++def test_invalid_ttl_rejected_before_connect(monkeypatch, name, value):
++    from langgraph_runtime_inmem.postgres import store_ttl_config
++
++    monkeypatch.setenv(name, value)
++    with pytest.raises(ValueError, match=name):
++        store_ttl_config()
++
++
++@pytest.mark.integration
++async def test_prune_is_atomic_on_mid_delete_failure(monkeypatch):
++    from langgraph_runtime_inmem.postgres import RuntimePostgresSaver
++
++    url = os.getenv("TEST_POSTGRES_DATABASE_URL")
++    if not url:
++        pytest.skip("TEST_POSTGRES_DATABASE_URL not configured")
++    tid = str(uuid.uuid4())
++    cfg = {"configurable": {"thread_id": tid}}
++    builder = StateGraph(GraphState)
++    builder.add_node("step", lambda state: {"events": ["node"]})
++    builder.add_edge(START, "step")
++    builder.add_edge("step", END)
++    async with RuntimePostgresSaver.from_conn_string(url) as saver:
++        await saver.setup()
++        graph = builder.compile(checkpointer=saver)
++        await graph.ainvoke({"events": ["a"], "payload": {}}, cfg)
++        before = [cp async for cp in saver.alist(cfg)]
++        original_cursor = saver._cursor
++
++        class FailingCursor:
++            def __init__(self, cursor):
++                self.cursor = cursor
++
++            def __getattr__(self, name):
++                return getattr(self.cursor, name)
++
++            async def executemany(self, query, params):
++                if query.startswith("DELETE FROM checkpoints "):
++                    raise RuntimeError("injected failure after write deletion")
++                return await self.cursor.executemany(query, params)
++
++        @asynccontextmanager
++        async def fail_cursor():
++            async with original_cursor() as cursor:
++                yield FailingCursor(cursor)
++
++        try:
++            with monkeypatch.context() as scoped:
++                scoped.setattr(saver, "_cursor", fail_cursor)
++                with pytest.raises(RuntimeError, match="injected"):
++                    await saver.aprune([tid])
++            after = [cp async for cp in saver.alist(cfg)]
++            assert after == before
++            assert (await graph.aget_state(cfg)).values["events"] == ["a", "node"]
++        finally:
++            await saver.adelete_thread(tid)
++
++
++@pytest.mark.integration
++async def test_real_pgvector_search_update_and_delete():
++    from langgraph_runtime_inmem.postgres import RuntimePostgresStore
++
++    url = os.getenv("TEST_POSTGRES_DATABASE_URL")
++    if not url:
++        pytest.skip("TEST_POSTGRES_DATABASE_URL not configured")
++    namespace = ("vector", str(uuid.uuid4()))
++    def embed(texts):
++        return [[1.0, 0.0] if "cat" in text else [0.0, 1.0] for text in texts]
++    async with RuntimePostgresStore.from_conn_string(
++        url, index={"dims": 2, "embed": embed, "fields": ["text"]},
++    ) as store:
++        await store.setup()
++        try:
++            await store.aput(namespace, "cat", {"text": "cat"})
++            await store.aput(namespace, "dog", {"text": "dog"})
++            found = await store.asearch(namespace, query="cat", limit=2)
++            assert found[0].key == "cat" and found[0].score == pytest.approx(1)
++            await store.aput(namespace, "cat", {"text": "dog"})
++            found = await store.asearch(namespace, query="cat", limit=2)
++            assert all(item.score == pytest.approx(0) for item in found)
++        finally:
++            await store.adelete(namespace, "cat")
++            await store.adelete(namespace, "dog")
++        async with store._cursor() as cur:
++            await cur.execute("SELECT count(*) AS n FROM store_vectors WHERE prefix LIKE %s", (f"%{namespace[1]}%",))
++            assert (await cur.fetchone())["n"] == 0
++
++
++@pytest.mark.integration
++async def test_subgraph_namespaces_survive_pruning():
++    from langgraph_runtime_inmem.postgres import RuntimePostgresSaver
++
++    url = os.getenv("TEST_POSTGRES_DATABASE_URL")
++    if not url:
++        pytest.skip("TEST_POSTGRES_DATABASE_URL not configured")
++    tid = str(uuid.uuid4())
++    cfg = {"configurable": {"thread_id": tid}}
++    child = StateGraph(GraphState)
++    child.add_node("child", lambda state: {"events": ["child"]})
++    child.add_edge(START, "child")
++    child.add_edge("child", END)
++    parent = StateGraph(GraphState)
++    parent.add_node("subgraph", child.compile(checkpointer=True))
++    parent.add_edge(START, "subgraph")
++    parent.add_edge("subgraph", END)
++    async with RuntimePostgresSaver.from_conn_string(url) as saver:
++        await saver.setup()
++        graph = parent.compile(checkpointer=saver)
++        try:
++            for i in range(3):
++                await graph.ainvoke({"events": [str(i)], "payload": {"v": i}}, cfg)
++            before = (await graph.aget_state(cfg, subgraphs=True)).values
++            namespaces_before = {cp.config["configurable"]["checkpoint_ns"] async for cp in saver.alist(cfg)}
++            assert len(namespaces_before) > 1
++            await saver.aprune([tid])
++            assert (await graph.aget_state(cfg, subgraphs=True)).values == before
++            retained = [cp async for cp in saver.alist(cfg)]
++            assert len(retained) == len(namespaces_before)
++            await graph.ainvoke({"events": ["after"]}, cfg)
++            assert "after" in (await graph.aget_state(cfg)).values["events"]
++        finally:
++            await saver.adelete_thread(tid)

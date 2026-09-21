@@ -1,0 +1,23 @@
+{
+  "dependencies": ["..", "langgraph-checkpoint-postgres", "psycopg[binary,pool]>=3.2"],
+  "graphs": {
+    "ttl_test": "./graph.py:graph"
+  },
+  "env": ".env",
+  "checkpointer": {
+    "path": "./postgres_checkpointer.py:checkpointer",
+    "ttl": {
+      "strategy": "keep_latest",
+      "sweep_interval_minutes": 1,
+      "default_ttl": 43200
+    }
+  },
+  "store": {
+    "path": "./postgres_store.py:store",
+    "ttl": {
+      "refresh_on_read": true,
+      "sweep_interval_minutes": 1,
+      "default_ttl": 10080
+    }
+  }
+}
