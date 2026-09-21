@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 from typing import Any
 
 import structlog
@@ -39,7 +40,16 @@ async def thread_ttl_sweep_loop() -> None:
             "Expected 'delete' or 'keep_latest'."
         )
 
-    interval_minutes = float(config.get("sweep_interval_minutes", 5))
+    try:
+        interval_minutes = float(config.get("sweep_interval_minutes", 5))
+    except (TypeError, ValueError):
+        raise ValueError(
+            "Thread TTL sweep interval must be a number of minutes."
+        ) from None
+    if not math.isfinite(interval_minutes) or interval_minutes < 0:
+        raise ValueError(
+            "Thread TTL sweep interval must be finite and greater than or equal to zero."
+        )
     # Zero is useful for integration tests but must not create a hot loop.
     interval_seconds = max(interval_minutes * 60, 0.1)
     await logger.ainfo(

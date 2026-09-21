@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import threading
 import time
 from collections import defaultdict
 from collections.abc import Iterator
@@ -8,17 +9,38 @@ from uuid import UUID
 
 logger = logging.getLogger(__name__)
 
+_stream_id_lock = threading.Lock()
+_last_stream_ms = -1
+_last_stream_seq = -1
+
 
 def _ensure_uuid(id: str | UUID) -> UUID:
     return UUID(id) if isinstance(id, str) else id
 
 
 def _generate_ms_seq_id() -> str:
-    """Generate a Redis-like millisecond-sequence ID (e.g., '1234567890123-0')"""
-    # Get current time in milliseconds
-    ms = int(time.time() * 1000)
-    # For simplicity, always use sequence 0 since we're not handling high throughput
-    return f"{ms}-0"
+    """Generate a process-wide monotonic Redis-style ``millisecond-sequence`` ID."""
+    global _last_stream_ms, _last_stream_seq
+
+    current_ms = int(time.time() * 1000)
+    with _stream_id_lock:
+        # Wall clocks can move backwards.  Preserve monotonic ordering by
+        # pinning to the last emitted millisecond and incrementing the sequence.
+        ms = max(current_ms, _last_stream_ms)
+        if ms == _last_stream_ms:
+            _last_stream_seq += 1
+        else:
+            _last_stream_ms = ms
+            _last_stream_seq = 0
+        return f"{_last_stream_ms}-{_last_stream_seq}"
+
+
+def _parse_ms_seq_id(value: str | bytes) -> tuple[int, int]:
+    text = value.decode() if isinstance(value, bytes) else value
+    ms, separator, seq = text.partition("-")
+    if not separator:
+        raise ValueError(f"Not a millisecond-sequence stream ID: {text!r}")
+    return int(ms), int(seq)
 
 
 @dataclass
@@ -231,15 +253,23 @@ class StreamManager:
         if message_id is None:
             return
         messages = self.message_stores.get(thread_id, {}).get(run_id, ())
-        try:
-            # Handle ms-seq format (e.g., "1234567890123-0")
-            for message in messages:
-                if message.id is not None and message.id.decode() > message_id:
-                    yield message
-        except TypeError:
-            # Try integer format if ms-seq fails
+
+        # Backward compatibility for the older index-based resume cursor.
+        if "-" not in message_id:
             message_idx = int(message_id) + 1
             yield from messages[message_idx:]
+            return
+
+        cursor = _parse_ms_seq_id(message_id)
+        for message in messages:
+            if message.id is None:
+                continue
+            try:
+                candidate = _parse_ms_seq_id(message.id)
+            except (UnicodeDecodeError, ValueError):
+                continue
+            if candidate > cursor:
+                yield message
 
     def get_queues_by_thread_id(self, thread_id: UUID | str) -> list[asyncio.Queue]:
         """Get all queues for a specific thread_id across all runs."""

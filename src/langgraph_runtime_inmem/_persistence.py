@@ -16,6 +16,7 @@ _stores: dict[str, weakref.ref[PersistentDict]] = {}
 _flush_thread: tuple[threading.Event, threading.Thread] | None = None
 _flush_interval: float = 10
 _registry_lock = threading.RLock()
+_PERSISTENCE_OWNER_ATTR = "_langgraph_runtime_persistence_owner"
 DISABLE_FILE_PERSISTENCE = (
     os.getenv("LANGGRAPH_DISABLE_FILE_PERSISTENCE", "false").lower() == "true"
 )
@@ -38,6 +39,10 @@ def register_persistent_dict(d: PersistentDict) -> None:
         current_ref = _stores.get(d.filename)
         current = current_ref() if current_ref is not None else None
         if current is not None and current is not d:
+            # Remember that this exact instance was denied ownership.  Merely
+            # observing an empty registry later must not grant it permission to
+            # sync stale data over the former owner's final snapshot.
+            setattr(d, _PERSISTENCE_OWNER_ATTR, False)
             logger.debug(
                 "Ignoring duplicate live persistence registration for %s",
                 d.filename,
@@ -45,6 +50,7 @@ def register_persistent_dict(d: PersistentDict) -> None:
             return
 
         _stores[d.filename] = weakref.ref(d)
+        setattr(d, _PERSISTENCE_OWNER_ATTR, True)
         if _flush_thread is None or not _flush_thread[1].is_alive():
             logger.info("Starting dev persistence flush loop")
             stop_event = threading.Event()
@@ -75,14 +81,25 @@ def close_persistent_dict(d: PersistentDict) -> None:
     final sync and its removal.  A live non-owner is cleared without syncing.
     """
     with _registry_lock:
+        ownership = getattr(d, _PERSISTENCE_OWNER_ATTR, None)
+        if ownership is False:
+            # This instance was explicitly denied ownership earlier.  That
+            # decision survives the original owner's close/unregistration.
+            # Clear the transient container without ever syncing it.
+            dict.clear(d)
+            return
+
         current_ref = _stores.get(d.filename)
         current = current_ref() if current_ref is not None else None
         if current is not None and current is not d:
-            # ``d`` was denied ownership at registration time.  Closing it
-            # must not perform a final sync over the live owner's file.
+            # A newer owner is present.  The stale instance must not touch the
+            # shared filename even if it used to own it.
+            setattr(d, _PERSISTENCE_OWNER_ATTR, False)
             dict.clear(d)
             return
+
         d.close()
+        setattr(d, _PERSISTENCE_OWNER_ATTR, None)
         if current_ref is not None:
             _stores.pop(d.filename, None)
 
