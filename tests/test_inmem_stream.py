@@ -267,3 +267,40 @@ async def test_stop_stream_signals_and_clears_every_state_map(
     assert replacement is not manager
     assert replacement._stopped is False
     assert _all_maps_empty(replacement)
+
+
+@pytest.mark.asyncio
+async def test_resumable_stream_ids_are_unique_and_numerically_ordered(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(inmem_stream.time, "time", lambda: 1234.567)
+    monkeypatch.setattr(inmem_stream, "_last_stream_ms", -1)
+    monkeypatch.setattr(inmem_stream, "_last_stream_seq", -1)
+
+    manager = StreamManager()
+    thread_id = uuid4()
+    run_id = uuid4()
+
+    for index in range(12):
+        await manager.put(
+            run_id,
+            thread_id,
+            Message(
+                topic=f"run:{run_id}:stream".encode(),
+                data=str(index).encode(),
+            ),
+            resumable=True,
+        )
+
+    messages = manager.message_stores[thread_id][run_id]
+    ids = [message.id.decode() for message in messages]
+    assert ids[0] == "1234567-0"
+    assert ids[-1] == "1234567-11"
+    assert len(ids) == len(set(ids))
+
+    # Numeric tuple ordering must handle sequence 10/11 correctly.  Plain
+    # string comparison would incorrectly place "-10" before "-2".
+    restored = list(manager.restore_messages(run_id, thread_id, ids[2]))
+    assert [message.data for message in restored] == [
+        str(index).encode() for index in range(3, 12)
+    ]

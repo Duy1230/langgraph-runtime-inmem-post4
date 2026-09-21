@@ -73,3 +73,23 @@ async def test_background_loop_invokes_sweeper(monkeypatch) -> None:
     assert fields["deleted_size"] == "256 B"
     assert fields["total_before"] == "1.0 KB"
     assert fields["deleted_ratio"] == "25.0%"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("interval", ["nan", "inf", "-1", -1])
+async def test_background_loop_rejects_invalid_interval(
+    monkeypatch: pytest.MonkeyPatch, interval
+) -> None:
+    from langgraph_api import config as api_config
+
+    monkeypatch.setattr(
+        api_config,
+        "THREAD_TTL",
+        {
+            "strategy": "delete",
+            "default_ttl": 1,
+            "sweep_interval_minutes": interval,
+        },
+    )
+    with pytest.raises(ValueError, match="finite"):
+        await thread_ttl.thread_ttl_sweep_loop()

@@ -6,6 +6,7 @@ import asyncio
 import base64
 import copy
 import json
+import math
 import typing
 import uuid
 from collections.abc import AsyncIterator, Sequence
@@ -70,6 +71,20 @@ StreamHandler = ContextQueue
 logger = structlog.stdlib.get_logger(__name__)
 
 _THREAD_TTL_STORE_KEY = "thread_ttls"
+_THREAD_TTL_MAINTENANCE: set[str] = set()
+
+
+async def _wait_for_thread_ttl_maintenance(thread_id: UUID | str) -> None:
+    """Wait until background TTL maintenance releases ``thread_id``.
+
+    Agent Server's in-memory metadata mutations run on the event loop.  Once
+    this wait returns, the run/thread mutation paths below perform their final
+    metadata changes without another await, preventing a sweeper from claiming
+    the same thread in the middle of that critical section.
+    """
+    thread_key = str(thread_id)
+    while thread_key in _THREAD_TTL_MAINTENANCE:
+        await asyncio.sleep(0.01)
 
 
 def _thread_ttl_store(conn: InMemConnectionProto) -> dict[str, dict[str, Any]]:
@@ -104,10 +119,20 @@ def _normalize_ttl_config(config: dict[str, Any] | None) -> dict[str, Any] | Non
         raise HTTPException(
             status_code=422, detail="Thread TTL must be a number of minutes."
         ) from None
+    if not math.isfinite(ttl_minutes):
+        raise HTTPException(status_code=422, detail="Thread TTL must be finite.")
     if ttl_minutes < 0:
         raise HTTPException(
             status_code=422, detail="Thread TTL must be greater than or equal to 0."
         )
+    try:
+        # Validate the exact operation used later by the sweeper/info path.
+        datetime.now(UTC) + timedelta(minutes=ttl_minutes)
+    except (OverflowError, ValueError):
+        raise HTTPException(
+            status_code=422,
+            detail="Thread TTL is outside the supported datetime range.",
+        ) from None
     return {"strategy": strategy, "ttl_minutes": ttl_minutes}
 
 
@@ -123,10 +148,12 @@ def _effective_thread_ttl(
     ttl_store = _thread_ttl_store(conn)
     state = ttl_store.get(str(thread_id), {})
     if "ttl_minutes" in state:
-        config = {
-            "strategy": state.get("strategy", "delete"),
-            "ttl_minutes": state["ttl_minutes"],
-        }
+        config = _normalize_ttl_config(
+            {
+                "strategy": state.get("strategy", "delete"),
+                "ttl_minutes": state["ttl_minutes"],
+            }
+        )
     else:
         config = _global_ttl_config()
     return config, state
@@ -1128,8 +1155,9 @@ class Threads(Authenticated):
                 thread_id=thread_id, metadata=metadata, if_exists=if_exists
             ),
         )
-        # Re-fetch in case an auth handler replaced the thread object in the store
-        # (e.g. via a loopback patch call, which deep-copies and replaces the element).
+        await _wait_for_thread_ttl_maintenance(thread_id)
+        # Re-fetch in case an auth handler or TTL maintenance replaced/removed
+        # the thread while the request was awaiting authorization/maintenance.
         existing_thread = next(
             (t for t in conn.store["threads"] if t["thread_id"] == thread_id), None
         )
@@ -1201,8 +1229,22 @@ class Threads(Authenticated):
                 "update",
                 Auth.types.ThreadsUpdate(thread_id=thread_id, metadata=metadata),
             )
-            if not filters or _check_filter_match(
-                thread_list[thread_idx]["metadata"], filters
+            await _wait_for_thread_ttl_maintenance(thread_id)
+
+            # ``await`` above may have allowed TTL deletion or another patch to
+            # replace the list element.  Resolve it again instead of using a
+            # stale list index.
+            thread_idx = next(
+                (
+                    idx
+                    for idx, thread in enumerate(thread_list)
+                    if thread["thread_id"] == thread_id
+                ),
+                None,
+            )
+            if thread_idx is not None and (
+                not filters
+                or _check_filter_match(thread_list[thread_idx]["metadata"], filters)
             ):
                 thread = copy.deepcopy(thread_list[thread_idx])
                 thread.setdefault("state_updated_at", thread.get("updated_at"))
@@ -1692,7 +1734,15 @@ class Threads(Authenticated):
             thread_id = thread["thread_id"]
             if thread_id in active_thread_ids:
                 continue
-            ttl_config, ttl_state = _effective_thread_ttl(conn, thread_id)
+            try:
+                ttl_config, ttl_state = _effective_thread_ttl(conn, thread_id)
+            except HTTPException as exc:
+                logger.warning(
+                    "Skipping thread with invalid TTL state",
+                    thread_id=str(thread_id),
+                    detail=exc.detail,
+                )
+                continue
             if ttl_config is None:
                 continue
             updated_at = _as_utc(thread["updated_at"])
@@ -1729,33 +1779,87 @@ class Threads(Authenticated):
         deleted = 0
         for offset in range(0, len(expired), batch_size):
             batch = expired[offset : offset + batch_size]
-            keep_latest_ids = [
-                str(thread_id)
-                for _, thread_id, ttl_config, _, _ in batch
-                if ttl_config["strategy"] == "keep_latest"
-            ]
-            if keep_latest_ids:
-                if checkpointer is None:
-                    checkpointer = await _get_checkpointer(conn)
-                await checkpointer.aprune(keep_latest_ids, strategy="keep_latest")
+            for _, thread_id, _selected_config, _selected_state, _selected_updated in batch:
+                thread_key = str(thread_id)
+                if thread_key in _THREAD_TTL_MAINTENANCE:
+                    continue
 
-            for _, thread_id, ttl_config, ttl_state, updated_at in batch:
-                if ttl_config["strategy"] == "delete":
+                # Claim the thread before the destructive await.  Runs.put and
+                # Threads.put/patch wait on this marker before their final
+                # metadata mutation, so a new foreground run cannot appear
+                # halfway through TTL deletion/pruning.
+                _THREAD_TTL_MAINTENANCE.add(thread_key)
+                try:
+                    current_thread = next(
+                        (
+                            thread
+                            for thread in conn.store["threads"]
+                            if thread["thread_id"] == thread_id
+                        ),
+                        None,
+                    )
+                    if current_thread is None:
+                        continue
+
+                    # Revalidate all mutable eligibility inputs after earlier
+                    # threads in this sweep may have awaited external cleanup.
+                    if any(
+                        run["thread_id"] == thread_id
+                        and run["status"] in {"pending", "running"}
+                        for run in conn.store["runs"]
+                    ):
+                        continue
+
                     try:
-                        deleted_iter = await Threads.delete(conn, thread_id)
-                        async for _ in deleted_iter:
-                            deleted += 1
-                            processed += 1
+                        ttl_config, ttl_state = _effective_thread_ttl(conn, thread_id)
                     except HTTPException as exc:
-                        if exc.status_code != 404:
-                            raise
-                else:
-                    # Do not prune the same inactive state every minute.  Any
-                    # later thread update advances ``updated_at`` and makes it
-                    # eligible again after another full TTL period.
-                    ttl_state["last_swept_updated_at"] = updated_at
-                    _thread_ttl_store(conn)[str(thread_id)] = ttl_state
-                    processed += 1
+                        logger.warning(
+                            "Skipping thread with invalid TTL state",
+                            thread_id=thread_key,
+                            detail=exc.detail,
+                        )
+                        continue
+                    if ttl_config is None:
+                        continue
+
+                    updated_at = _as_utc(current_thread["updated_at"])
+                    last_swept = ttl_state.get("last_swept_updated_at")
+                    if (
+                        ttl_config["strategy"] == "keep_latest"
+                        and last_swept is not None
+                        and _as_utc(last_swept) >= updated_at
+                    ):
+                        continue
+
+                    expires_at = updated_at + timedelta(
+                        minutes=ttl_config["ttl_minutes"]
+                    )
+                    if expires_at > datetime.now(UTC):
+                        continue
+
+                    if ttl_config["strategy"] == "delete":
+                        try:
+                            deleted_iter = await Threads.delete(conn, thread_id)
+                            async for _ in deleted_iter:
+                                deleted += 1
+                                processed += 1
+                        except HTTPException as exc:
+                            if exc.status_code != 404:
+                                raise
+                    else:
+                        if checkpointer is None:
+                            checkpointer = await _get_checkpointer(conn)
+                        await checkpointer.aprune(
+                            [thread_key], strategy="keep_latest"
+                        )
+                        # Do not prune the same inactive state every minute.
+                        # Any later thread update advances ``updated_at`` and
+                        # makes it eligible again after another full TTL period.
+                        ttl_state["last_swept_updated_at"] = updated_at
+                        _thread_ttl_store(conn)[thread_key] = ttl_state
+                        processed += 1
+                finally:
+                    _THREAD_TTL_MAINTENANCE.discard(thread_key)
 
         if stats is not None:
             deleted_size = (
@@ -2824,6 +2928,17 @@ class Runs(Authenticated):
                 assistant.get("metadata", {}), assistant_filters
             ):
                 return _empty_generator()
+
+        if thread_id is not None:
+            await _wait_for_thread_ttl_maintenance(thread_id)
+            # TTL maintenance can delete the thread while auth handlers are
+            # running.  Re-resolve after the maintenance gate before the
+            # mutation section, which contains no further await for an
+            # existing thread.
+            existing_thread = next(
+                (t for t in conn.store["threads"] if t["thread_id"] == thread_id),
+                None,
+            )
 
         if existing_thread and filters:
             # Reject if the user doesn't own the thread

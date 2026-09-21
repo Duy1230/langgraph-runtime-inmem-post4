@@ -100,6 +100,7 @@ def reset_config(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr(api_config, "THREAD_TTL", None)
     monkeypatch.setattr(api_config, "USE_CUSTOM_CHECKPOINTER", False)
+    ops._THREAD_TTL_MAINTENANCE.clear()
 
 
 def add_checkpoint(
@@ -650,6 +651,7 @@ def test_keep_latest_preserves_delta_ancestor_chain(saver) -> None:
         parent_id="0002",
         value=["delta-2"],
         materialized=False,
+        metadata_extra={"counters_since_delta_snapshot": {"state": (2, 3)}},
     )
     # An obsolete fork should still be removed.
     add_checkpoint(
@@ -713,3 +715,100 @@ async def test_manual_keep_latest_prune_uses_checkpointer(
         == 1
     )
     assert set(saver.storage[str(thread["thread_id"])][""]) == {"0002"}
+
+
+@pytest.mark.parametrize("ttl", ["nan", "inf", "-inf", 1e308])
+def test_invalid_thread_ttl_values_are_rejected(ttl) -> None:
+    with pytest.raises(HTTPException) as exc_info:
+        ops._normalize_ttl_config({"strategy": "delete", "ttl": ttl})
+    assert exc_info.value.status_code == 422
+
+
+def test_keep_latest_does_not_retain_non_delta_empty_ancestors(saver) -> None:
+    thread_id = uuid4()
+    add_checkpoint(saver, thread_id, "0001", value="materialized")
+    add_checkpoint(
+        saver,
+        thread_id,
+        "0002",
+        parent_id="0001",
+        value="ordinary-empty",
+        materialized=False,
+    )
+
+    saver.prune([str(thread_id)], strategy="keep_latest")
+
+    assert set(saver.storage[str(thread_id)][""]) == {"0002"}
+    assert (str(thread_id), "", "0001") not in saver.writes
+
+
+@pytest.mark.asyncio
+async def test_ttl_sweep_revalidates_activity_after_await(
+    conn, saver, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager = StreamManager()
+    monkeypatch.setattr(ops, "get_stream_manager", lambda: manager)
+
+    first = await create_thread(
+        conn, ttl={"strategy": "delete", "ttl": 1}, age_minutes=3
+    )
+    second = await create_thread(
+        conn, ttl={"strategy": "delete", "ttl": 1}, age_minutes=2
+    )
+
+    async def cleanup(thread_id, _conn, run_id=None):
+        # Deleting the older first thread yields to external cleanup.  During
+        # that await, a foreground run becomes active on the second thread.
+        if thread_id == first["thread_id"]:
+            conn.store["runs"].append(
+                {
+                    "run_id": uuid4(),
+                    "thread_id": second["thread_id"],
+                    "status": "running",
+                }
+            )
+        await asyncio.sleep(0)
+
+    monkeypatch.setattr(ops, "_delete_checkpoints_for_thread", cleanup)
+
+    assert await ops.Threads.sweep_ttl(conn) == (1, 1)
+    remaining = {thread["thread_id"] for thread in conn.store["threads"]}
+    assert first["thread_id"] not in remaining
+    assert second["thread_id"] in remaining
+
+
+@pytest.mark.asyncio
+async def test_run_creation_waits_for_ttl_maintenance(conn) -> None:
+    thread = await create_thread(conn)
+    assistant_id = uuid4()
+    run_id = uuid4()
+    conn.store["assistants"].append(
+        {
+            "assistant_id": assistant_id,
+            "graph_id": "graph",
+            "config": {},
+            "context": {},
+            "metadata": {"created_by": "system"},
+        }
+    )
+
+    thread_key = str(thread["thread_id"])
+    ops._THREAD_TTL_MAINTENANCE.add(thread_key)
+    task = asyncio.create_task(
+        ops.Runs.put(
+            conn,
+            assistant_id,
+            {"config": {}},
+            thread_id=thread["thread_id"],
+            run_id=run_id,
+            metadata={},
+            prevent_insert_if_inflight=False,
+        )
+    )
+    await asyncio.sleep(0)
+    assert not task.done()
+
+    ops._THREAD_TTL_MAINTENANCE.discard(thread_key)
+    iterator = await asyncio.wait_for(task, timeout=1)
+    created = await anext(iterator)
+    assert created["run_id"] == run_id

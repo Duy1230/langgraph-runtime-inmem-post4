@@ -313,3 +313,26 @@ async def test_store_periodic_flush_persists_data_vectors_and_ttl_mutations(
     assert _load_pickle(vector_path) == {}
     assert _load_pickle(ttl_path) == {}
     store.close()
+
+
+def test_denied_duplicate_cannot_clobber_after_owner_closes(
+    tmp_path: Path, isolated_registry, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(_persistence, "_flush_interval", 60)
+    path = tmp_path / "late-contender.pckl"
+    owner = PersistentDict(dict, {"source": "owner-initial"}, filename=str(path))
+    contender = PersistentDict(
+        dict, {"source": "contender-stale"}, filename=str(path)
+    )
+
+    _persistence.register_persistent_dict(owner)
+    _persistence.register_persistent_dict(contender)
+    owner["source"] = "owner-final"
+
+    _persistence.close_persistent_dict(owner)
+    assert _load_pickle(path) == {"source": "owner-final"}
+
+    # The denied contender is closed only after the registry became empty.
+    # It still must not acquire write permission retroactively.
+    _persistence.close_persistent_dict(contender)
+    assert _load_pickle(path) == {"source": "owner-final"}

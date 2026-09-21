@@ -600,15 +600,25 @@ class InMemorySaver(InMemorySaverBase):
                 keep_ids = {latest_id}
                 latest_entry = checkpoints[latest_id]
                 latest_checkpoint = self.serde.loads_typed(latest_entry[0])
+                latest_metadata = self.serde.loads_typed(latest_entry[1])
+                delta_counters = (
+                    latest_metadata.get("counters_since_delta_snapshot", {})
+                    if isinstance(latest_metadata, dict)
+                    else {}
+                )
+                if not isinstance(delta_counters, dict):
+                    delta_counters = {}
 
-                # Missing/empty values need the ancestor write chain.  This is
-                # how DeltaChannel stores non-snapshot checkpoints.
+                # Only DeltaChannel state needs the ancestor write chain.  A
+                # generic missing/empty blob without this metadata must not
+                # cause unrelated history to be retained indefinitely.
                 needed_channels = {
                     channel
                     for channel, version in latest_checkpoint.get(
                         "channel_versions", {}
                     ).items()
-                    if (
+                    if channel in delta_counters
+                    and (
                         (
                             blob := self.blobs.get(
                                 (thread_id, checkpoint_ns, channel, version)
@@ -620,7 +630,11 @@ class InMemorySaver(InMemorySaverBase):
                 }
 
                 parent_id = latest_entry[2]
+                visited: set[Any] = set()
                 while parent_id is not None and needed_channels:
+                    if parent_id in visited:
+                        break
+                    visited.add(parent_id)
                     parent_entry = checkpoints.get(parent_id)
                     if parent_entry is None:
                         break
