@@ -14,7 +14,7 @@ docker rm "$transfer_id"
 Verify the bundled wheel after extraction:
 
 ```bash
-sha256sum langgraph-runtime-inmem-post4/src/wheel/langgraph_runtime_inmem-0.33.3.post4+review.20260919-py3-none-any.whl
+sha256sum langgraph-runtime-inmem-post4/wheel/langgraph_runtime_inmem-0.33.3.post4+review.20260919-py3-none-any.whl
 ```
 
 Expected SHA-256:
