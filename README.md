@@ -7,7 +7,7 @@
 
 ## Local PostgreSQL review candidate (2026-09-19)
 
-The local version `0.33.3.post4+review.20260919` adds wheel-packaged PostgreSQL
+The local version `0.33.3.post4+review.20260921` adds wheel-packaged PostgreSQL
 hooks, bounded reconnecting pools, numeric Store range filters, fractional TTL
 refresh, run checkpoint deletion and delta-safe `keep_latest` pruning. Built-in
 Store snapshots are loaded only when that Store is actually used.
