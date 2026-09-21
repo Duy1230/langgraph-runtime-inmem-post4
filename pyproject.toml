@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "langgraph-runtime-inmem"
-version = "0.33.3.post4+review.20260919"
+version = "0.33.3.post4+review.20260921"
 description = "In-memory implementation for the LangGraph API server, patched with TTL, persistence, and lifecycle fixes."
 readme = "README.md"
 requires-python = ">=3.11"
